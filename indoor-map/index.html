@@ -53,6 +53,10 @@
         // Mapbox indoor data model (docs.mapbox.com/help/dive-deeper/indoor-mapping): the floor chosen in IndoorControl
         // decides which features are drawn, through the `is-active-floor` expression.
         const ACTIVE_FLOOR = ['is-active-floor', ['get', 'floor_id']];
+        // A floor feature is its own floor (it has no floor_id). The slab is the thin raised plate under the rooms of a floor above
+        // ground: labels and icons (`symbol-z-elevate`) rest on it, so they rise with the floor instead of staying on the street.
+        const ACTIVE_FLOOR_SLAB = ['is-active-floor', ['get', 'id']];
+        const SLAB_FILTER = ['all', ['==', ['get', 'type'], 'floor'], ACTIVE_FLOOR_SLAB, ['>', ['get', 'ground_z_offset'], 0]];
         const IS_POI = ['all', ['==', ['get', 'type'], 'room'], ['==', ['get', 'shape_type'], 'poi']];
         const IS_ROOM = ['all', ['==', ['get', 'type'], 'room'], ['!=', ['get', 'class'], 'wall'], ['!=', ['get', 'shape_type'], 'poi']];
         const IS_SHOP_POI = ['in', ['get', 'icon'], ['literal', ['shop', 'restaurant', 'cafe', 'bank', 'hospital', 'pharmacy']]];
@@ -115,6 +119,15 @@
                         {
                             id: 'building-clip', type: 'clip', source: 'indoor', filter: ['==', ['get', 'type'], 'facility'],
                             layout: { 'clip-layer-types': ['model', 'symbol'] }
+                        },
+                        {
+                            id: 'floor-slab', type: 'fill-extrusion', source: 'indoor', filter: SLAB_FILTER,
+                            paint: {
+                                'fill-extrusion-color': '#cfcfcf', 'fill-extrusion-base': ['get', 'base_height'],
+                                // the top stays just under the rooms: equal heights z-fight
+                                'fill-extrusion-height': ['-', ['get', 'height'], 0.3], 'fill-extrusion-opacity': 0.9,
+                                'fill-extrusion-cast-shadows': false
+                            }
                         },
                         {
                             id: 'room-fills', type: 'fill', source: 'indoor', filter: ['all', IS_ROOM, ACTIVE_FLOOR],
