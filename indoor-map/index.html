@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- send the full page URL as the Referer to Mapbox, so a token restricted to this page's path matches (the default sends the origin only) -->
+    <meta name="referrer" content="no-referrer-when-downgrade">
+    <title>indoor-generator demo – indoor map</title>
+    <link href="https://api.mapbox.com/mapbox-gl-js/v3.32.0/mapbox-gl.css" rel="stylesheet">
+    <script src="https://api.mapbox.com/mapbox-gl-js/v3.32.0/mapbox-gl.js"></script>
+    <style>
+        html,
+        body,
+        #map {
+            margin: 0;
+            height: 100%;
+        }
+
+        #note {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, .9);
+            font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #222;
+        }
+
+        #note a {
+            color: #1a6dcc;
+        }
+
+        #disclaimer {
+            margin-top: 4px;
+            max-width: 340px;
+            font-size: 11px;
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div id="note"><select id="building"></select> · made with <a href="https://github.com/akiramur/indoor-generator">indoor-generator</a>
+        <div id="disclaimer">非公式・参考用。形状は公式図面などをもとにした推定を含みます。<br>Unofficial, for reference only. Shapes include estimates based on official floor plans and other sources.</div>
+    </div>
+    <script>
+        // A public (pk.*) token restricted to this site's URL.
+        mapboxgl.accessToken = 'pk.eyJ1IjoibXVyYW8iLCJhIjoiY212aTQycmd2MDF4dzJ3cXN2cmFqeTk3ayJ9._RO6uqLqB57eA2CskHeorA';
+
+        // Mapbox indoor data model (docs.mapbox.com/help/dive-deeper/indoor-mapping): the floor chosen in IndoorControl
+        // decides which features are drawn, through the `is-active-floor` expression.
+        const ACTIVE_FLOOR = ['is-active-floor', ['get', 'floor_id']];
+        const IS_POI = ['all', ['==', ['get', 'type'], 'room'], ['==', ['get', 'shape_type'], 'poi']];
+        const IS_ROOM = ['all', ['==', ['get', 'type'], 'room'], ['!=', ['get', 'class'], 'wall'], ['!=', ['get', 'shape_type'], 'poi']];
+        const IS_SHOP_POI = ['in', ['get', 'icon'], ['literal', ['shop', 'restaurant', 'cafe', 'bank', 'hospital', 'pharmacy']]];
+        const IS_SEAT_POI = ['==', ['get', 'icon'], 'seat'];
+        const IS_ROW_LABEL = ['==', ['get', 'icon'], 'row-label'];
+        const IS_PLAIN_POI = ['all', ['!', IS_SHOP_POI], ['!', IS_SEAT_POI], ['!', IS_ROW_LABEL]];
+        const SEAT_TEXT = {
+            'text-font': ['DIN Pro Bold', 'Arial Unicode MS Bold'],
+            'text-size': ['interpolate', ['exponential', 2], ['zoom'], 21, 8, 23, 32],
+            'text-rotation-alignment': 'map', 'text-pitch-alignment': 'map', 'text-rotate': ['get', 'facing_deg'],
+            'text-allow-overlap': true, 'text-ignore-placement': true
+        };
+
+        // Badge images (the Standard style's sprite is not reachable from our own layers): a circle with a label, a seat is a rectangle
+        function addPoiImages(map, badges) {
+            for (const [icon, [text, color]] of Object.entries(badges)) {
+                const c = document.createElement('canvas'), g = c.getContext('2d');
+                if (icon.startsWith('seat')) {
+                    c.width = 38; c.height = 56;
+                    g.fillStyle = color; g.beginPath(); g.roundRect(2, 2, 34, 52, 7); g.fill();
+                    g.lineWidth = 2; g.strokeStyle = '#fff'; g.stroke();
+                } else {
+                    c.width = c.height = 56;
+                    g.fillStyle = color; g.beginPath(); g.arc(28, 28, 25, 0, Math.PI * 2); g.fill();
+                    g.lineWidth = 3; g.strokeStyle = '#fff'; g.stroke();
+                    g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
+                    g.font = `bold ${text.length > 2 ? 18 : 24}px sans-serif`;
+                    g.fillText(text, 28, 29);
+                }
+                map.addImage('poi-' + icon, g.getImageData(0, 0, c.width, c.height), { pixelRatio: 2 });
+            }
+        }
+        const IS_WALL = ['all', ['==', ['get', 'type'], 'room'], ['==', ['get', 'class'], 'wall']];
+
+        // the list of buildings (data/index.json); the chosen one is kept in ?b=<slug>, changing it reloads the page
+        const params = new URLSearchParams(location.search);
+        fetch('data/index.json').then(r => r.json()).then(list => {
+            const slug = (list.find(b => b.slug === params.get('b')) || list[0]).slug;
+            const select = document.getElementById('building');
+            list.forEach(b => select.add(new Option(b.name, b.slug, false, b.slug === slug)));
+            select.onchange = () => { params.set('b', select.value); location.search = params; };
+            return Promise.all([fetch(`data/${slug}.geojson`).then(r => r.json()), fetch('data/badges.json').then(r => r.json())]);
+        }).then(([data, badges]) => {
+            const structures = {};
+            data.features.filter(f => f.properties.type === 'structure')
+                .forEach(f => { structures[f.properties.id] = { sourceId: 'indoor' }; });
+            const bounds = new mapboxgl.LngLatBounds();
+            data.features.filter(f => f.properties.type === 'facility')
+                .forEach(f => f.geometry.coordinates[0].forEach(c => bounds.extend(c)));
+
+            const map = new mapboxgl.Map({
+                container: 'map',
+                style: {
+                    version: 8,
+                    imports: [{ id: 'basemap', url: 'mapbox://styles/mapbox/standard', config: { showIndoor: false } }],
+                    sources: { indoor: { type: 'geojson', data, promoteId: 'id' } },
+                    indoor: structures,
+                    layers: [
+                        // cut the Standard style's own 3D building away where the indoor map is
+                        {
+                            id: 'building-clip', type: 'clip', source: 'indoor', filter: ['==', ['get', 'type'], 'facility'],
+                            layout: { 'clip-layer-types': ['model', 'symbol'] }
+                        },
+                        {
+                            id: 'room-fills', type: 'fill', source: 'indoor', filter: ['all', IS_ROOM, ACTIVE_FLOOR],
+                            paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.92, 'fill-z-offset': ['get', 'lift'] }
+                        },
+                        {
+                            id: 'walls', type: 'fill-extrusion', source: 'indoor', filter: ['all', IS_WALL, ACTIVE_FLOOR],
+                            paint: {
+                                'fill-extrusion-color': '#9a9a9a', 'fill-extrusion-base': ['get', 'lift'],
+                                'fill-extrusion-height': ['+', ['get', 'lift'], ['get', 'wall_height']],
+                                'fill-extrusion-line-width': 0.3, 'fill-extrusion-opacity': 0.85
+                            }
+                        },
+                        {
+                            id: 'room-labels', type: 'symbol', source: 'indoor', filter: ['all', IS_ROOM, ACTIVE_FLOOR],
+                            layout: { 'text-field': ['get', 'name'], 'text-size': 11, 'symbol-z-elevate': true },
+                            paint: { 'text-color': '#222', 'text-halo-color': '#fff', 'text-halo-width': 1.2 }
+                        },
+                        // facility icons (toilets, lifts, ...), shops when zoomed in, seats drawn to scale (about 0.45 x 0.7 m), row numbers
+                        {
+                            id: 'poi', type: 'symbol', source: 'indoor', filter: ['all', IS_POI, IS_PLAIN_POI, ACTIVE_FLOOR],
+                            layout: { 'icon-image': ['concat', 'poi-', ['get', 'icon']], 'icon-size': 0.5, 'icon-allow-overlap': true, 'symbol-z-elevate': true }
+                        },
+                        {
+                            id: 'poi-shop', type: 'symbol', source: 'indoor', minzoom: 18, filter: ['all', IS_POI, IS_SHOP_POI, ACTIVE_FLOOR],
+                            layout: { 'icon-image': ['concat', 'poi-', ['get', 'icon']], 'icon-size': 0.36, 'icon-allow-overlap': true, 'symbol-z-elevate': true },
+                            paint: { 'icon-opacity': 0.85 }
+                        },
+                        {
+                            id: 'poi-seat', type: 'symbol', source: 'indoor', minzoom: 19.5, filter: ['all', IS_POI, IS_SEAT_POI, ACTIVE_FLOOR],
+                            layout: {
+                                'icon-image': ['case', ['==', ['get', 'fixed'], false], 'poi-seat-temp',
+                                    ['==', ['get', 'tier'], 2], 'poi-seat-2', ['==', ['get', 'tier'], 3], 'poi-seat-3', 'poi-seat'],
+                                'icon-allow-overlap': true, 'symbol-z-elevate': true,
+                                'icon-rotation-alignment': 'map', 'icon-pitch-alignment': 'map', 'icon-rotate': ['get', 'facing_deg'],
+                                'icon-size': ['interpolate', ['exponential', 2], ['zoom'], 19.5, 0.25, 22, 1.4],
+                                'text-field': ['to-string', ['get', 'number']], ...SEAT_TEXT
+                            },
+                            paint: {
+                                'icon-opacity': 0.95, 'text-color': ['case', ['==', ['get', 'fixed'], false], '#333', '#fff'],
+                                'text-opacity': ['step', ['zoom'], 0, 20.9, 1]
+                            }
+                        },
+                        {
+                            id: 'poi-seat-row', type: 'symbol', source: 'indoor', minzoom: 19.5, filter: ['all', IS_POI, IS_ROW_LABEL, ACTIVE_FLOOR],
+                            layout: { 'text-field': ['to-string', ['get', 'row']], 'symbol-z-elevate': true, ...SEAT_TEXT },
+                            paint: { 'text-color': '#333', 'text-opacity': ['step', ['zoom'], 0, 20.9, 1] }
+                        }
+                    ]
+                },
+                bounds, fitBoundsOptions: { padding: 60, maxZoom: 19.5 },
+                pitch: 50, bearing: 160, antialias: true
+            });
+            map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'top-right');
+            map.addControl(new mapboxgl.IndoorControl(), 'bottom-right');   // floor selector (from zoom 16)
+
+            // IndoorControl's state lives in the renderer's indoor manager (experimental API); it fires `selector-update`.
+            // While a floor is shown, the Standard style's own building is cut out (clip layer) and the surrounding 3D buildings
+            // stay flat so they do not hide it. When the floors are hidden (the control's top button, or zooming out), the
+            // clip is lifted and the 3D buildings come back, so the real building is drawn again.
+            function followFloors(tries = 0) {
+                const mgr = map.style && map.style.indoorManager;
+                if (!mgr) { if (tries < 40) setTimeout(() => followFloors(tries + 1), 250); return; }
+                const apply = (state) => {
+                    const shown = !!(state && state.activeFloorsVisible);
+                    map.setFilter('building-clip', shown ? ['==', ['get', 'type'], 'facility'] : false);
+                    map.setConfigProperty('basemap', 'show3dBuildings', !shown);
+                };
+                mgr.on('selector-update', (e) => apply(e && e.floors ? e : mgr.getControlState()));
+                apply(mgr.getControlState());
+            }
+            map.on('load', () => { addPoiImages(map, badges); followFloors(); });
+        });
+    </script>
+</body>
+
+</html>
